@@ -104,6 +104,8 @@ entry fun finish_publish(
     bitcoin_chain_id: address,
     guardian_url: Option<String>,
     guardian_public_key: Option<vector<u8>>,
+    bitcoin_confirmation_threshold: Option<u64>,
+    bitcoin_deposit_time_delay_ms: Option<u64>,
     coin_registry: &mut sui::coin_registry::CoinRegistry,
     ctx: &mut TxContext,
 ) {
@@ -126,6 +128,24 @@ entry fun finish_publish(
     } else {
         guardian_url.destroy_none();
         guardian_public_key.destroy_none();
+    };
+
+    if (bitcoin_confirmation_threshold.is_some()) {
+        hashi::btc_config::set_bitcoin_confirmation_threshold(
+            self.config_mut(),
+            bitcoin_confirmation_threshold.destroy_some(),
+        );
+    } else {
+        bitcoin_confirmation_threshold.destroy_none();
+    };
+
+    if (bitcoin_deposit_time_delay_ms.is_some()) {
+        hashi::btc_config::set_bitcoin_deposit_time_delay_ms(
+            self.config_mut(),
+            bitcoin_deposit_time_delay_ms.destroy_some(),
+        );
+    } else {
+        bitcoin_deposit_time_delay_ms.destroy_none();
     };
 
     let (treasury_cap, metadata_cap) = hashi::btc::create(coin_registry, ctx);
