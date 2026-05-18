@@ -32,6 +32,7 @@ use hashi_types::guardian::crypto::commit_share;
 use hashi_types::guardian::crypto::split_secret;
 use hashi_types::guardian::proto_conversions::provisioner_init_request_to_pb;
 use hashi_types::guardian::proto_conversions::share_commitment_to_pb;
+use hashi_types::guardian::session_id_from_signing_pubkey;
 use hashi_types::proto as pb;
 use hashi_types::proto::guardian_service_client::GuardianServiceClient;
 use hpke::Deserializable;
@@ -96,8 +97,8 @@ pub async fn run(args: Args, onchain_state: &OnchainState) -> Result<()> {
         s3_config: Some(pb::S3Config {
             access_key: Some(access_key),
             secret_key: Some(secret_key),
-            bucket_name: Some(bucket),
-            region: Some(region),
+            bucket_name: Some(bucket.clone()),
+            region: Some(region.clone()),
         }),
         share_commitments: material
             .commitments
@@ -117,10 +118,42 @@ pub async fn run(args: Args, onchain_state: &OnchainState) -> Result<()> {
         .await
         .context("GetGuardianInfo RPC failed")?
         .into_inner();
-    let info = GetGuardianInfoResponse::try_from(info_pb)
+    let resp = GetGuardianInfoResponse::try_from(info_pb)
         .map_err(|e| anyhow!("decode GetGuardianInfoResponse: {e:?}"))?;
-    let enc_pubkey = EncPubKey::from_bytes(&info.signed_info.data.encryption_pubkey)
-        .map_err(|e| anyhow!("decode guardian encryption pubkey: {e:?}"))?;
+    let session_id = session_id_from_signing_pubkey(&resp.signing_pub_key);
+
+    // Verify the enclave's own signature on the info — without this the
+    // `encryption_pubkey` below would be unauthenticated and a buggy or
+    // hostile endpoint could trick us into encrypting shares to a key it
+    // controls.
+    let info = resp
+        .signed_info
+        .verify(&resp.signing_pub_key)
+        .map_err(|e| anyhow!("verify GuardianInfo signature (session={session_id}): {e:?}"))?;
+
+    // Match against what we just sent in OperatorInit. Catches a stale or
+    // wrong enclave echoing back a different config than the one we set up.
+    let returned_bucket = info.bucket_info.as_ref().ok_or_else(|| {
+        anyhow!("guardian info missing bucket_info; OperatorInit may have silently failed")
+    })?;
+    anyhow::ensure!(
+        returned_bucket.bucket == bucket && returned_bucket.region == region,
+        "bucket mismatch: submitted {region}/{bucket}, guardian echoed {}/{}",
+        returned_bucket.region,
+        returned_bucket.bucket,
+    );
+    let returned_commitments = info
+        .share_commitments
+        .as_ref()
+        .ok_or_else(|| anyhow!("guardian info missing share_commitments"))?;
+    anyhow::ensure!(
+        *returned_commitments == material.commitments,
+        "share commitment mismatch: guardian echoed different commitments than were submitted"
+    );
+
+    let enc_pubkey = EncPubKey::from_bytes(&info.encryption_pubkey)
+        .map_err(|e| anyhow!("decode guardian encryption pubkey (session={session_id}): {e:?}"))?;
+    tracing::info!(session_id = %session_id, "guardian info verified");
 
     let withdrawal_config = WithdrawalConfig {
         committee_threshold,
@@ -156,7 +189,26 @@ pub async fn run(args: Args, onchain_state: &OnchainState) -> Result<()> {
             .with_context(|| format!("ProvisionerInit share {} RPC failed", i + 1))?;
     }
 
+    // Pin: confirm we're still talking to the same enclave session we set up.
+    // If the guardian restarted between OperatorInit and now, the new session
+    // would have a different signing key — and the shares we just submitted
+    // would belong to a session that no longer exists.
+    let post_resp_pb = client
+        .get_guardian_info(pb::GetGuardianInfoRequest {})
+        .await
+        .context("post-ProvisionerInit GetGuardianInfo RPC failed")?
+        .into_inner();
+    let post_resp = GetGuardianInfoResponse::try_from(post_resp_pb)
+        .map_err(|e| anyhow!("decode post-ProvisionerInit GetGuardianInfoResponse: {e:?}"))?;
+    let post_session_id = session_id_from_signing_pubkey(&post_resp.signing_pub_key);
+    anyhow::ensure!(
+        post_session_id == session_id,
+        "guardian session changed mid-bootstrap: started {session_id}, now {post_session_id} \
+         (enclave likely restarted; rerun bootstrap)"
+    );
+
     println!("Guardian fully initialized.");
+    println!("  session_id:               {session_id}");
     println!(
         "  master pubkey:            {}",
         hex::encode(material.master_pubkey.serialize())
