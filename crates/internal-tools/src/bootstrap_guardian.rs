@@ -1,0 +1,234 @@
+// Copyright (c) Mysten Labs, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Drive a fresh hashi-guardian from heartbeating-only to fully-initialized.
+//! Scrapes the on-chain `HashiCommittee`, generates BTC master + Shamir shares
+//! in memory, then runs OperatorInit -> GetGuardianInfo -> ProvisionerInit
+//! until the guardian reaches THRESHOLD shares.
+
+use std::env;
+
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::anyhow;
+use bitcoin::secp256k1::Keypair;
+use bitcoin::secp256k1::Secp256k1;
+use bitcoin::secp256k1::SecretKey as BtcSecretKey;
+use clap::Parser;
+use hashi::onchain::OnchainState;
+use hashi_types::committee::certificate_threshold;
+use hashi_types::guardian::BitcoinPubkey;
+use hashi_types::guardian::EncPubKey;
+use hashi_types::guardian::GetGuardianInfoResponse;
+use hashi_types::guardian::LimiterState;
+use hashi_types::guardian::ProvisionerInitRequest;
+use hashi_types::guardian::ProvisionerInitState;
+use hashi_types::guardian::Share;
+use hashi_types::guardian::ShareCommitment;
+use hashi_types::guardian::ShareCommitments;
+use hashi_types::guardian::WithdrawalConfig;
+use hashi_types::guardian::crypto::THRESHOLD;
+use hashi_types::guardian::crypto::commit_share;
+use hashi_types::guardian::crypto::split_secret;
+use hashi_types::guardian::proto_conversions::provisioner_init_request_to_pb;
+use hashi_types::guardian::proto_conversions::share_commitment_to_pb;
+use hashi_types::proto as pb;
+use hashi_types::proto::guardian_service_client::GuardianServiceClient;
+use hpke::Deserializable;
+use rand::CryptoRng;
+use rand::RngCore;
+use rand::thread_rng;
+
+#[derive(Parser)]
+pub struct Args {
+    /// gRPC endpoint of the deployed guardian.
+    #[arg(
+        long,
+        env = "GUARDIAN_ENDPOINT",
+        default_value = "http://localhost:3000"
+    )]
+    guardian_endpoint: String,
+
+    /// Token-bucket refill rate (sats / sec).
+    #[arg(long, env = "HASHI_REFILL_RATE_SATS_PER_SEC")]
+    refill_rate_sats_per_sec: u64,
+
+    /// Token-bucket max capacity (sats).
+    #[arg(long, env = "HASHI_MAX_BUCKET_CAPACITY_SATS")]
+    max_bucket_capacity_sats: u64,
+
+    /// Bitcoin network (mainnet/testnet/regtest/signet).
+    #[arg(long, env = "BITCOIN_NETWORK", default_value = "signet")]
+    bitcoin_network: String,
+}
+
+pub async fn run(args: Args, onchain_state: &OnchainState) -> Result<()> {
+    // AWS creds stay env-only — passing them as CLI flags would leak via `ps`.
+    let bucket = required_env("AWS_S3_BUCKET")?;
+    let region = required_env("AWS_REGION")?;
+    let access_key = required_env("AWS_ACCESS_KEY_ID")?;
+    let secret_key = required_env("AWS_SECRET_ACCESS_KEY")?;
+    let network = parse_network(&args.bitcoin_network)?;
+
+    let committee = onchain_state
+        .current_committee()
+        .ok_or_else(|| anyhow!("no current committee on chain (DKG not yet complete?)"))?;
+    let committee_epoch = committee.epoch();
+    let committee_threshold = certificate_threshold(committee.total_weight());
+    tracing::info!(
+        committee_epoch,
+        committee_total_weight = committee.total_weight(),
+        committee_threshold,
+        num_members = committee.members().len(),
+        "fetched on-chain committee"
+    );
+
+    let mut rng = thread_rng();
+    let material = generate_share_material(&mut rng);
+    tracing::info!(master_pubkey = %hex::encode(material.master_pubkey.serialize()),
+        "generated share material");
+
+    let mut client = GuardianServiceClient::connect(args.guardian_endpoint.clone())
+        .await
+        .with_context(|| format!("connect to guardian at {}", args.guardian_endpoint))?;
+
+    let operator_init_req = pb::OperatorInitRequest {
+        s3_config: Some(pb::S3Config {
+            access_key: Some(access_key),
+            secret_key: Some(secret_key),
+            bucket_name: Some(bucket),
+            region: Some(region),
+        }),
+        share_commitments: material
+            .commitments
+            .iter()
+            .map(share_commitment_to_pb)
+            .collect(),
+        network: Some(network as i32),
+    };
+    tracing::info!("calling OperatorInit");
+    client
+        .operator_init(operator_init_req)
+        .await
+        .context("OperatorInit RPC failed")?;
+
+    let info_pb = client
+        .get_guardian_info(pb::GetGuardianInfoRequest {})
+        .await
+        .context("GetGuardianInfo RPC failed")?
+        .into_inner();
+    let info = GetGuardianInfoResponse::try_from(info_pb)
+        .map_err(|e| anyhow!("decode GetGuardianInfoResponse: {e:?}"))?;
+    let enc_pubkey = EncPubKey::from_bytes(&info.signed_info.data.encryption_pubkey)
+        .map_err(|e| anyhow!("decode guardian encryption pubkey: {e:?}"))?;
+
+    let withdrawal_config = WithdrawalConfig {
+        committee_threshold,
+        refill_rate_sats_per_sec: args.refill_rate_sats_per_sec,
+        max_bucket_capacity_sats: args.max_bucket_capacity_sats,
+    };
+    let limiter_state = LimiterState {
+        num_tokens_available: withdrawal_config.max_bucket_capacity_sats,
+        last_updated_at: 0,
+        next_seq: 0,
+    };
+    let state = ProvisionerInitState::new(
+        committee,
+        withdrawal_config,
+        limiter_state,
+        material.master_pubkey,
+    )
+    .map_err(|e| anyhow!("build ProvisionerInitState: {e:?}"))?;
+
+    for (i, share) in material.shares.iter().take(THRESHOLD).enumerate() {
+        tracing::info!("submitting ProvisionerInit share {}/{THRESHOLD}", i + 1);
+        let req = ProvisionerInitRequest::build_from_share_and_state(
+            share,
+            &enc_pubkey,
+            state.clone(),
+            &mut rng,
+        );
+        let pb_req = provisioner_init_request_to_pb(req)
+            .map_err(|e| anyhow!("encode ProvisionerInitRequest: {e:?}"))?;
+        client
+            .provisioner_init(pb_req)
+            .await
+            .with_context(|| format!("ProvisionerInit share {} RPC failed", i + 1))?;
+    }
+
+    println!("Guardian fully initialized.");
+    println!(
+        "  master pubkey:            {}",
+        hex::encode(material.master_pubkey.serialize())
+    );
+    println!("  committee_epoch:          {committee_epoch}");
+    println!("  committee_threshold:      {committee_threshold}");
+    println!(
+        "  refill_rate_sats_per_sec: {}",
+        args.refill_rate_sats_per_sec
+    );
+    println!(
+        "  max_bucket_capacity_sats: {}",
+        args.max_bucket_capacity_sats
+    );
+    Ok(())
+}
+
+struct ShareMaterial {
+    shares: Vec<Share>,
+    commitments: ShareCommitments,
+    master_pubkey: BitcoinPubkey,
+}
+
+/// Fresh BTC master key + Shamir shares + matching commitments, all in memory.
+/// `master_pubkey` is the x-only key the guardian reconstructs from any
+/// THRESHOLD shares.
+fn generate_share_material<R: CryptoRng + RngCore>(rng: &mut R) -> ShareMaterial {
+    let k256_sk = k256::SecretKey::random(&mut *rng);
+
+    let shares = split_secret(&k256_sk, rng);
+    let commitments_vec: Vec<ShareCommitment> = shares.iter().map(commit_share).collect();
+    let commitments =
+        ShareCommitments::new(commitments_vec).expect("split_secret produces NUM_OF_SHARES shares");
+
+    let secp = Secp256k1::new();
+    let btc_sk = BtcSecretKey::from_slice(&k256_sk.to_bytes())
+        .expect("k256 secret key bytes are a valid secp256k1 secret");
+    let keypair = Keypair::from_secret_key(&secp, &btc_sk);
+    let (master_pubkey, _parity) = keypair.x_only_public_key();
+
+    ShareMaterial {
+        shares,
+        commitments,
+        master_pubkey,
+    }
+}
+
+fn required_env(name: &str) -> Result<String> {
+    env::var(name).map_err(|_| anyhow!("required env var `{name}` is not set"))
+}
+
+fn parse_network(s: &str) -> Result<pb::Network> {
+    pb::Network::from_str_name(&s.to_ascii_uppercase()).ok_or_else(|| {
+        anyhow!("unknown BITCOIN_NETWORK `{s}`; expected mainnet/testnet/regtest/signet")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hashi_types::guardian::crypto::NUM_OF_SHARES;
+    use hashi_types::guardian::crypto::combine_shares;
+
+    #[test]
+    fn generated_shares_reconstruct_to_master_pubkey() {
+        let mut rng = rand::thread_rng();
+        let material = generate_share_material(&mut rng);
+
+        assert_eq!(material.shares.len(), NUM_OF_SHARES);
+        let subset = &material.shares[..THRESHOLD];
+        let reconstructed = combine_shares(subset).expect("threshold shares combine");
+        let (reconstructed_xonly, _) = reconstructed.x_only_public_key();
+        assert_eq!(reconstructed_xonly, material.master_pubkey);
+    }
+}

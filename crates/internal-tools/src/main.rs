@@ -12,6 +12,7 @@ use clap::Subcommand;
 use hashi::config::Config;
 use hashi::onchain::OnchainState;
 
+mod bootstrap_guardian;
 mod dump_utxos;
 mod key_recovery;
 mod sweep_utxos;
@@ -53,6 +54,12 @@ enum Commands {
         config: ConfigArgs,
     },
     SweepUtxos(sweep_utxos::Args),
+    BootstrapGuardian {
+        #[command(flatten)]
+        config: ConfigArgs,
+        #[command(flatten)]
+        args: bootstrap_guardian::Args,
+    },
 }
 
 #[tokio::main]
@@ -92,6 +99,19 @@ async fn main() -> anyhow::Result<()> {
                     .await
                     .context("failed to connect to Sui RPC")?;
             dump_utxos::run(&onchain_state)
+        }
+        Commands::BootstrapGuardian { config, args } => {
+            let cfg = config.load()?;
+            let sui_rpc = cfg
+                .sui_rpc
+                .as_deref()
+                .ok_or_else(|| anyhow!("config missing sui-rpc"))?;
+            println!("Connecting to Sui RPC: {sui_rpc}");
+            let (onchain_state, _watcher) =
+                OnchainState::new(sui_rpc, cfg.hashi_ids(), None, None, None)
+                    .await
+                    .context("failed to connect to Sui RPC")?;
+            bootstrap_guardian::run(args, &onchain_state).await
         }
     }
 }
