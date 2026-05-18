@@ -343,7 +343,20 @@ impl MpcService {
             mgr.reconstruct_current_from_stored_rotation(&certificates)
         };
         match result {
-            Ok(output) => Ok(Some(output)),
+            Ok(output) => {
+                let recovered_key = bcs::to_bytes(&output.public_key)
+                    .expect("public key serialization should succeed");
+                if recovered_key != onchain_state.mpc_public_key() {
+                    warn!(
+                        "try_recover_from_stored_rotation: reconstructed key {} \
+                         does not match on-chain key {}; falling back to live protocol",
+                        hex::encode(&recovered_key),
+                        hex::encode(onchain_state.mpc_public_key()),
+                    );
+                    return Ok(None);
+                }
+                Ok(Some(output))
+            }
             Err(e) => {
                 warn!(
                     "try_recover_from_stored_rotation: reconstruction failed ({e}); falling back to live protocol"
