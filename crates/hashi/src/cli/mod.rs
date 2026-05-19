@@ -517,6 +517,16 @@ pub struct PublishOpts {
     #[clap(long)]
     pub guardian_public_key: Option<String>,
 
+    /// Override `bitcoin_confirmation_threshold` on-chain at publish time.
+    /// Falls back to the Move package's `init_defaults` (currently 6) when omitted.
+    #[clap(long)]
+    pub bitcoin_confirmation_threshold: Option<u64>,
+
+    /// Override `bitcoin_deposit_time_delay_ms` on-chain at publish time.
+    /// Falls back to the Move package's `init_defaults` (currently 600_000) when omitted.
+    #[clap(long)]
+    pub bitcoin_deposit_time_delay_ms: Option<u64>,
+
     /// Enable verbose output
     #[clap(long, short)]
     pub verbose: bool,
@@ -910,6 +920,11 @@ pub async fn run_publish(opts: PublishOpts) -> anyhow::Result<()> {
         ),
     };
 
+    let bitcoin_overrides = crate::publish::BitcoinConfigOverrides {
+        confirmation_threshold: opts.bitcoin_confirmation_threshold,
+        deposit_time_delay_ms: opts.bitcoin_deposit_time_delay_ms,
+    };
+
     // Publish + init
     print_info("Publishing and initializing ...");
     let ids = crate::publish::publish_and_init(
@@ -918,6 +933,7 @@ pub async fn run_publish(opts: PublishOpts) -> anyhow::Result<()> {
         compiled,
         &opts.bitcoin_chain_id,
         guardian.as_ref(),
+        &bitcoin_overrides,
     )
     .await?;
     print_success(&format!("package_id:      {}", ids.package_id));
