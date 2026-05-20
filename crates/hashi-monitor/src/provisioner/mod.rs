@@ -1,11 +1,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use hpke::Deserializable;
 mod config;
 mod heartbeat_checks;
+mod limiter_recovery;
 
-use crate::kp::config::GuardianConfig;
 use anyhow::Context;
 use hashi_guardian::s3_logger::S3Logger;
 use hashi_types::guardian::EncPubKey;
@@ -14,12 +13,16 @@ use hashi_types::guardian::GuardianInfo;
 use hashi_types::guardian::LimiterState;
 use hashi_types::guardian::ProvisionerInitRequest;
 use hashi_types::guardian::ProvisionerInitState;
+use hashi_types::guardian::S3_DIR_INIT;
 use hashi_types::guardian::proto_conversions::provisioner_init_request_to_pb;
 use hashi_types::guardian::session_id_from_signing_pubkey;
 use hashi_types::guardian::verify_enclave_attestation;
 use hashi_types::proto as pb;
+use hpke::Deserializable;
 use rand::thread_rng;
 use tracing::info;
+
+use crate::provisioner::config::GuardianConfig;
 
 pub use config::ProvisionerConfig;
 
@@ -29,7 +32,7 @@ pub async fn run(cfg: ProvisionerConfig) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!(e))?;
 
     // 1. Check no past enclave's heartbeats remain & gather the latest enclave's session id.
-    let session_id = heartbeat_checks::kp_heartbeat_audit(&s3_client).await?;
+    let session_id = heartbeat_checks::heartbeat_audit(&s3_client).await?;
     info!(session_id, "heartbeat checks passed for selected session");
 
     // 2. Check that enclave's config is as expected (valid attestation, expected s3 bucket & share commitments)
@@ -38,17 +41,38 @@ pub async fn run(cfg: ProvisionerConfig) -> anyhow::Result<()> {
     expected_guardian_config.ensure_matches_info(&guardian_info)?;
     info!(session_id, "init checks passed for selected session");
 
-    // TODO: replace mock limiter state with actual state from S3 logs.
-    let committee = cfg.hashi_committee.try_into()?;
-    let mock_limiter_state = LimiterState {
-        num_tokens_available: cfg.withdrawal_config.max_bucket_capacity_sats,
-        last_updated_at: 0,
-        next_seq: 0,
+    // 3. Detect whether this is a first deployment or a rotation, and source
+    // the initial limiter state accordingly.
+    let mode = detect_deployment_mode(&s3_client, &session_id).await?;
+    info!(?mode, "detected deployment mode");
+    let limiter_state = match mode {
+        DeploymentMode::Rotation => {
+            match limiter_recovery::recover_limiter_state(s3_client.clone()).await? {
+                Some(mut recovered) => {
+                    // Cap to the current config's bucket capacity in case max capacity
+                    // was lowered across the rotation. (Raising is fine — refill will
+                    // fill it.)
+                    recovered.num_tokens_available = recovered
+                        .num_tokens_available
+                        .min(cfg.withdrawal_config.max_bucket_capacity_sats);
+                    recovered
+                }
+                None => {
+                    tracing::warn!(
+                        "rotation detected but prior enclave has no Success logs within walk-back window; falling back to genesis limiter state"
+                    );
+                    LimiterState::genesis(&cfg.withdrawal_config)
+                }
+            }
+        }
+        DeploymentMode::Genesis => LimiterState::genesis(&cfg.withdrawal_config),
     };
+
+    let committee = cfg.hashi_committee.try_into()?;
     let state = ProvisionerInitState::new(
         committee,
         cfg.withdrawal_config,
-        mock_limiter_state,
+        limiter_state,
         cfg.hashi_btc_master_pubkey,
     )
     .map_err(|e| anyhow::anyhow!(e))?;
@@ -79,6 +103,55 @@ pub async fn run(cfg: ProvisionerConfig) -> anyhow::Result<()> {
         .await?;
     }
     Ok(())
+}
+
+/// Whether this provisioner-init is for the very first enclave in this S3
+/// bucket or a rotation onto a successor enclave. Determined from S3 init logs
+/// — see [`detect_deployment_mode`] — and used to switch between sourcing
+/// initial state from config (genesis) vs. recovering it from the prior
+/// enclave's logs (rotation). Future genesis/rotation-aware behaviors (e.g.,
+/// committee fetch) can match on the same enum.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DeploymentMode {
+    Genesis,
+    Rotation,
+}
+
+/// Inspects S3 init logs for any session other than `current_session_id`.
+/// Presence of one or more such session ⇒ Rotation; otherwise Genesis.
+///
+/// Bails on any key under `init/` that doesn't match the expected
+/// `{session_id}-{suffix}` layout — unexpected keys shouldn't exist there
+/// and silently ignoring them could mask a real prior session.
+async fn detect_deployment_mode(
+    s3_client: &S3Logger,
+    current_session_id: &str,
+) -> anyhow::Result<DeploymentMode> {
+    let prefix = format!("{}/", S3_DIR_INIT);
+    let keys = s3_client
+        .list_all_keys_in_dir(&prefix)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    for key in keys {
+        let session_id = extract_session_id_from_init_key(&key, &prefix)?;
+        if session_id != current_session_id {
+            return Ok(DeploymentMode::Rotation);
+        }
+    }
+    Ok(DeploymentMode::Genesis)
+}
+
+/// Extracts the session_id from an `init/{session_id}-{suffix}.json` key.
+/// session_id is the lowercase hex of the enclave signing pubkey, so it
+/// contains no dashes — the first '-' after the prefix delimits it.
+fn extract_session_id_from_init_key<'a>(key: &'a str, prefix: &str) -> anyhow::Result<&'a str> {
+    let after_prefix = key
+        .strip_prefix(prefix)
+        .ok_or_else(|| anyhow::anyhow!("unexpected init log key (missing prefix): {key}"))?;
+    let (session_id, _suffix) = after_prefix
+        .split_once('-')
+        .ok_or_else(|| anyhow::anyhow!("unexpected init log key (no suffix delimiter): {key}"))?;
+    Ok(session_id)
 }
 
 /// Implements check B of IOP-225.
@@ -155,4 +228,33 @@ async fn prechecks(
     expected_guardian_config.ensure_matches_info(&info)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_session_id_strips_prefix_and_takes_up_to_first_dash() {
+        let session = "abcdef1234567890";
+        let key = format!("init/{session}-oi-attestation-unsigned.json");
+        assert_eq!(
+            extract_session_id_from_init_key(&key, "init/").unwrap(),
+            session
+        );
+    }
+
+    #[test]
+    fn extract_session_id_rejects_missing_prefix() {
+        let err = extract_session_id_from_init_key("withdraw/abc-suffix.json", "init/")
+            .expect_err("must fail on wrong prefix");
+        assert!(err.to_string().contains("missing prefix"));
+    }
+
+    #[test]
+    fn extract_session_id_rejects_missing_suffix_delimiter() {
+        let err = extract_session_id_from_init_key("init/abcdef.json", "init/")
+            .expect_err("must fail on no dash after prefix");
+        assert!(err.to_string().contains("no suffix delimiter"));
+    }
 }

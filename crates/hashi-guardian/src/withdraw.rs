@@ -36,13 +36,16 @@ pub async fn standard_withdrawal(
     match normal_withdrawal_inner(enclave.clone(), signed_request).await {
         Ok((txid, response, limiter_guard)) => {
             info!("Withdrawal {} processed successfully. Logging to S3.", wid);
+            let post_state = *limiter_guard.state();
             let msg = WithdrawalLogMessage::Success {
                 txid,
                 request_data: unsigned_request,
                 request_sign: request_signature,
                 response: response.clone(),
+                post_state,
             };
             log_withdrawal_success(enclave.as_ref(), wid, msg, limiter_guard).await?;
+            // <-- Limiter guard drops upon log_withdrawal_success return. Next withdrawal can begin.
             Ok(enclave.sign(response))
         }
         Err(withdraw_err) => {
@@ -58,7 +61,6 @@ pub async fn standard_withdrawal(
     }
 }
 
-// TODO: Support batched withdrawals (multiple wids per transaction).
 async fn normal_withdrawal_inner(
     enclave: Arc<Enclave>,
     signed_request: HashiSigned<StandardWithdrawalRequest>,
@@ -145,6 +147,10 @@ impl LimiterGuard {
     /// Mark this withdrawal as successful. Prevents revert on drop.
     pub fn commit(mut self) {
         self.committed = true;
+    }
+
+    pub fn state(&self) -> &hashi_types::guardian::LimiterState {
+        self.guard.state()
     }
 }
 
@@ -248,11 +254,7 @@ mod tests {
             .set_withdrawal_config(withdrawal_config)
             .unwrap();
 
-        let limiter_state = LimiterState {
-            num_tokens_available: max_bucket_capacity_sats,
-            last_updated_at: 0,
-            next_seq: 0,
-        };
+        let limiter_state = LimiterState::genesis(&withdrawal_config);
         let init_state = ProvisionerInitState::new(
             committee,
             withdrawal_config,
