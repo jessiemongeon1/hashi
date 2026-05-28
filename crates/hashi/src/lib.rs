@@ -63,6 +63,8 @@ pub struct Hashi {
     guardian_client: OnceLock<Option<grpc::guardian_client::GuardianClient>>,
     guardian_signing_pubkey: OnceLock<Option<hashi_types::guardian::GuardianPubKey>>,
     local_limiter: OnceLock<Arc<guardian_limiter::LocalLimiter>>,
+    /// `(seq, wid)` of the last guardian-finalized withdrawal, for pacing.
+    guardian_last_finalized: RwLock<Option<(u64, sui_sdk_types::Address)>>,
     /// Reconfig completion signatures by epoch.
     reconfig_signatures: RwLock<HashMap<u64, Vec<u8>>>,
 }
@@ -92,6 +94,7 @@ impl Hashi {
             guardian_client: OnceLock::new(),
             guardian_signing_pubkey: OnceLock::new(),
             local_limiter: OnceLock::new(),
+            guardian_last_finalized: RwLock::new(None),
             reconfig_signatures: RwLock::new(HashMap::new()),
         }))
     }
@@ -121,8 +124,27 @@ impl Hashi {
             guardian_client: OnceLock::new(),
             guardian_signing_pubkey: OnceLock::new(),
             local_limiter: OnceLock::new(),
+            guardian_last_finalized: RwLock::new(None),
             reconfig_signatures: RwLock::new(HashMap::new()),
         }))
+    }
+
+    pub(crate) fn guardian_should_defer_finalize(
+        &self,
+        next_seq: u64,
+        wid: sui_sdk_types::Address,
+    ) -> bool {
+        let last = *self.guardian_last_finalized.read().unwrap();
+        guardian_limiter::should_defer_guardian_finalize(next_seq, last, wid)
+    }
+
+    /// Record a successful guardian finalize; monotonic in `seq`.
+    pub(crate) fn record_guardian_finalized(&self, seq: u64, wid: sui_sdk_types::Address) {
+        let mut last = self.guardian_last_finalized.write().unwrap();
+        match *last {
+            Some((prev_seq, _)) if seq < prev_seq => {}
+            _ => *last = Some((seq, wid)),
+        }
     }
 
     pub fn onchain_state(&self) -> &onchain::OnchainState {

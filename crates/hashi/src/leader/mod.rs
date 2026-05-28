@@ -1426,6 +1426,18 @@ impl LeaderService {
                 );
                 return Ok(());
             }
+            // Pace guardian finalize on the local limiter to avoid reusing a consumed seq.
+            if inner.guardian_client().is_some()
+                && inner.guardian_should_defer_finalize(next_seq, txn.id)
+            {
+                debug!(
+                    withdrawal_txn_id = %txn.id,
+                    next_seq,
+                    "Deferring guardian finalize until local limiter catches up to guardian seq"
+                );
+                inner.metrics.guardian_finalize_deferred_total.inc();
+                return Ok(());
+            }
             Some(next_seq)
         } else {
             None
@@ -1465,6 +1477,7 @@ impl LeaderService {
                 seq,
             )
             .await?;
+            inner.record_guardian_finalized(seq, txn.id);
         }
 
         // 4. Build the WithdrawalTxSigning and get BLS certificate via fan-out
